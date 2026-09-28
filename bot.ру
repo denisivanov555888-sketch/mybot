@@ -1,0 +1,357 @@
+import random
+import logging
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
+)
+from aiogram.client.session.aiohttp import AiohttpSession
+import asyncio
+
+# -------------------------------------------------------------
+# ВСЕ ДАННЫЕ УЖЕ ВСТАВЛЕНЫ:
+TOKEN = "8872628448:AAEEyCPCvOViCWjWEM7QCKlWFxgoCKeEGfY"
+# -------------------------------------------------------------
+
+# НАСТРОЙКА ПРОКСИ ДЛЯ PYTHONANYWHERE:
+session = AiohttpSession(proxy="http://proxy.server:3128")
+bot = Bot(token=TOKEN, session=session)
+dp = Dispatcher(storage=MemoryStorage())
+
+# Картинки для оформления
+IMG_START = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800"
+IMG_VIP = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800"
+IMG_ROOM = "https://images.unsplash.com/photo-1563089145-599997674d42?w=800"
+
+RIDDLES = [
+    {"q": "Что принадлежит вам, но другие используют его чаще, чем вы?", "a": "Ваше имя"},
+    {"q": "Чем больше из меня берут, тем больше я становлюсь. Что я такое?", "a": "Яма"},
+    {"q": "У чего есть язычок, но нет рта, есть подошва, но нет ног?", "a": "У ботинка"}
+]
+
+logging.basicConfig(level=logging.INFO)
+
+# Данные в памяти
+rooms = {}                 # pin -> user_id
+active_chats = {}          # user_id -> target_user_id
+chat_msg_count = {}        # (u1, u2) -> count
+user_rooms_created = {}    # user_id -> int
+user_bonus_rooms = {}      # user_id -> int
+user_reset_date = {}       # user_id -> datetime
+vip_users = {}             # user_id -> datetime
+known_users = set()        
+
+random_queue = []          
+
+FREE_ROOMS_LIMIT = 2
+
+class ChatState(StatesGroup):
+    waiting_for_pin = State()
+    in_chat = State()
+
+def is_vip(user_id: int) -> bool:
+    if user_id in vip_users:
+        if datetime.now() < vip_users[user_id]:
+            return True
+        else:
+            del vip_users[user_id]
+    return False
+
+def check_and_reset_monthly_limit(user_id: int):
+    now = datetime.now()
+    if user_id not in user_reset_date:
+        user_reset_date[user_id] = now + timedelta(days=30)
+        user_rooms_created[user_id] = 0
+        user_bonus_rooms[user_id] = 0
+    elif now >= user_reset_date[user_id]:
+        user_rooms_created[user_id] = 0
+        user_bonus_rooms[user_id] = 0
+        user_reset_date[user_id] = now + timedelta(days=30)
+
+def get_total_rooms_limit(user_id: int) -> int:
+    bonus = user_bonus_rooms.get(user_id, 0)
+    return FREE_ROOMS_LIMIT + bonus
+
+def get_chat_key(u1: int, u2: int):
+    return tuple(sorted([u1, u2]))
+
+# Клавиатуры
+def main_keyboard(user_id: int):
+    check_and_reset_monthly_limit(user_id)
+    created = user_rooms_created.get(user_id, 0)
+    total_limit = get_total_rooms_limit(user_id)
+    left_rooms = max(0, total_limit - created)
+    
+    if is_vip(user_id):
+        room_btn = "🔑 Создать комнату (♾️ VIP)"
+        vip_btn = "👑 VIP Статус"
+    else:
+        room_btn = f"🔑 Создать комнату ({left_rooms}/{total_limit})"
+        vip_btn = "🔥 СКИДКА: VIP 50 ⭐️"
+
+    kb = [
+        [KeyboardButton(text="🎲 Случайный собеседник")],
+        [KeyboardButton(text=room_btn), KeyboardButton(text="🚪 Войти по ПИН")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🤝 Реферальная программа")],
+        [KeyboardButton(text=vip_btn), KeyboardButton(text="⭐️ Поддержать проект")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def searching_keyboard():
+    kb = [[KeyboardButton(text="❌ Отменить поиск")]]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def in_chat_keyboard():
+    kb = [
+        [KeyboardButton(text="🧩 Загадка")],
+        [KeyboardButton(text="⏭️ Следующий собеседник"), KeyboardButton(text="❌ Завершить диалог")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def vip_buy_inline_keyboard():
+    kb = [[InlineKeyboardButton(text="⚡ Забрать VIP за 50 ⭐️ (~~75 ⭐️~~)", callback_data="buy_vip_50")]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def donate_inline_keyboard():
+    kb = [
+        [InlineKeyboardButton(text="5 ⭐️", callback_data="donate_5"), InlineKeyboardButton(text="10 ⭐️", callback_data="donate_10")],
+        [InlineKeyboardButton(text="15 ⭐️", callback_data="donate_15"), InlineKeyboardButton(text="30 ⭐️", callback_data="donate_30")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# Команда Start
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message, command: CommandObject, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    check_and_reset_monthly_limit(uid)
+
+    if uid not in known_users:
+        known_users.add(uid)
+        args = command.args
+        if args and args.startswith("ref_"):
+            try:
+                referrer_id = int(args.split("_")[1])
+                if referrer_id != uid:
+                    check_and_reset_monthly_limit(referrer_id)
+                    user_bonus_rooms[referrer_id] = user_bonus_rooms.get(referrer_id, 0) + 1
+                    try:
+                        await bot.send_message(
+                            referrer_id,
+                            f"🎉 **По вашей ссылке зарегистрировался новый пользователь!**\n\n"
+                            f"🎁 Вам начислена **+1 доп. комната**!",
+                            parse_mode="Markdown",
+                            reply_markup=main_keyboard(referrer_id)
+                        )
+                    except Exception:
+                        pass
+            except ValueError:
+                pass
+
+    if uid in random_queue:
+        random_queue.remove(uid)
+
+    if uid in active_chats:
+        peer_id = active_chats.pop(uid, None)
+        if peer_id and peer_id in active_chats:
+            active_chats.pop(peer_id, None)
+            await bot.send_message(peer_id, "💔 Собеседник покинул чат.", reply_markup=main_keyboard(peer_id))
+
+    await message.answer_photo(
+        photo=IMG_START,
+        caption="✨ **Добро пожаловать в «Приватный Чат»!** ✨\n\nСоздавайте комнаты по ПИН-коду или ищите случайных собеседников!",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(uid)
+    )
+
+# Поддержка проекта
+@dp.message(F.text.contains("Поддержать проект"))
+async def support_project(message: types.Message):
+    await message.answer("❤️ **Выберите сумму в Telegram Stars для поддержки проекта:**", parse_mode="Markdown", reply_markup=donate_inline_keyboard())
+
+@dp.callback_query(F.data.startswith("donate_"))
+async def send_donate_invoice(callback: types.CallbackQuery):
+    amount = int(callback.data.split("_")[1])
+    prices = [LabeledPrice(label="Поддержка проекта", amount=amount)]
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="❤️ Поддержка проекта",
+        description=f"Пожертвование {amount} Stars на развитие бота.",
+        payload=f"donate_{amount}_stars",
+        currency="XTR",
+        prices=prices,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⭐ Отправить {amount} Stars", pay=True)]])
+    )
+    await callback.answer()
+
+# Рефералка
+@dp.message(F.text.contains("Реферальная программа"))
+async def referral_info(message: types.Message):
+    uid = message.from_user.id
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+    await message.answer(
+        f"🤝 **РЕФЕРАЛЬНАЯ ПРОГРАММА**\n\nПриглашайте друзей и получайте **+1 комнату** за каждого!\n\n🔗 Ссылка:\n`{ref_link}`",
+        parse_mode="Markdown"
+    )
+
+# Поиск случайного собеседника
+@dp.message(F.text == "🎲 Случайный собеседник")
+async def start_random_search(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid in active_chats:
+        await message.answer("⚠️ Вы уже в диалоге!")
+        return
+    if uid in random_queue:
+        await message.answer("🔍 Вы уже ищете собеседника...")
+        return
+
+    if len(random_queue) > 0:
+        peer_id = random_queue.pop(0)
+        active_chats[uid] = peer_id
+        active_chats[peer_id] = uid
+        chat_key = get_chat_key(uid, peer_id)
+        chat_msg_count[chat_key] = 0
+
+        await state.set_state(ChatState.in_chat)
+        await message.answer("🎉 **Собеседник найден!** Приятного общения!", reply_markup=in_chat_keyboard())
+        await bot.send_message(peer_id, "🎉 **Собеседник найден!** Приятного общения!", reply_markup=in_chat_keyboard())
+    else:
+        random_queue.append(uid)
+        await message.answer("🔍 **Ищем свободного собеседника...**", reply_markup=searching_keyboard())
+
+@dp.message(F.text == "❌ Отменить поиск")
+async def cancel_search(message: types.Message):
+    uid = message.from_user.id
+    if uid in random_queue:
+        random_queue.remove(uid)
+        await message.answer("🛑 Поиск отменен.", reply_markup=main_keyboard(uid))
+
+@dp.message(F.text == "⏭️ Следующий собеседник")
+async def next_partner(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid in active_chats:
+        peer_id = active_chats.pop(uid)
+        if peer_id in active_chats:
+            active_chats.pop(peer_id)
+            await bot.send_message(peer_id, "🔴 Собеседник перешел к следующему чату.", reply_markup=main_keyboard(peer_id))
+        await state.clear()
+        await start_random_search(message, state)
+
+# Профиль
+@dp.message(F.text.contains("Профиль"))
+async def profile_cmd(message: types.Message):
+    uid = message.from_user.id
+    check_and_reset_monthly_limit(uid)
+    status = "👑 VIP" if is_vip(uid) else "Бесплатный"
+    await message.answer(f"👤 **ВАШ ПРОФИЛЬ**\n\nСтатус: **{status}**\nДоступно комнат: **{get_total_rooms_limit(uid)}**", parse_mode="Markdown")
+
+# VIP
+@dp.message(F.text.contains("VIP") | F.text.contains("СКИДКА"))
+async def vip_info(message: types.Message):
+    await message.answer_photo(
+        photo=IMG_VIP,
+        caption="🎉 **VIP-ПОДПИСКА НА 30 ДНЕЙ!**\n\nЦена: **50 ⭐️** (вместо ~~75 ⭐️~~)\n\n• Безлимит сообщений и комнат\n• Голосовые и видео файлы",
+        parse_mode="Markdown",
+        reply_markup=vip_buy_inline_keyboard()
+    )
+
+@dp.callback_query(F.data == "buy_vip_50")
+async def send_invoice(callback: types.CallbackQuery):
+    prices = [LabeledPrice(label="VIP Подписка", amount=50)]
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="👑 VIP-Статус",
+        description="Безлимитное общение на 30 дней",
+        payload="vip_subscription_30_days",
+        currency="XTR",
+        prices=prices,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ Оплатить 50 Stars", pay=True)]])
+    )
+    await callback.answer()
+
+@dp.pre_checkout_query()
+async def pre_checkout_process(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    uid = message.from_user.id
+    if message.successful_payment.invoice_payload == "vip_subscription_30_days":
+        vip_users[uid] = datetime.now() + timedelta(days=30)
+        await message.answer("🎉 **VIP-подписка активирована!**", reply_markup=main_keyboard(uid))
+    else:
+        await message.answer("❤️ **Спасибо за поддержку!**", reply_markup=main_keyboard(uid))
+
+# Загадка в чате
+@dp.message(F.text == "🧩 Загадка")
+async def send_riddle(message: types.Message):
+    riddle = random.choice(RIDDLES)
+    await message.answer(f"🧩 **Загадка для развлечения:**\n\n{riddle['q']}\n\n||Ответ: {riddle['a']}||", parse_mode="Markdown")
+
+# Комнаты по ПИН
+@dp.message(F.text.contains("Создать комнату"))
+async def create_room(message: types.Message):
+    uid = message.from_user.id
+    if uid in active_chats:
+        await message.answer("⚠️ Вы уже в диалоге!")
+        return
+
+    pin = str(random.randint(1000, 9999))
+    rooms[pin] = uid
+    await message.answer_photo(photo=IMG_ROOM, caption=f"🔒 **Комната создана!**\n\n🔑 ПИН-код: `{pin}`\nПередайте этот код собеседнику.", parse_mode="Markdown")
+
+@dp.message(F.text.contains("Войти по ПИН"))
+async def enter_pin_prompt(message: types.Message, state: FSMContext):
+    await state.set_state(ChatState.waiting_for_pin)
+    await message.answer("🔢 **Введите ПИН-код:**", reply_markup=ReplyKeyboardRemove())
+
+@dp.message(ChatState.waiting_for_pin)
+async def process_pin(message: types.Message, state: FSMContext):
+    pin = message.text.strip()
+    uid = message.from_user.id
+    if pin in rooms:
+        host_id = rooms.pop(pin)
+        active_chats[uid] = host_id
+        active_chats[host_id] = uid
+        await state.set_state(ChatState.in_chat)
+        await message.answer("🟢 **Вы подключились к чату!**", reply_markup=in_chat_keyboard())
+        await bot.send_message(host_id, "🟢 **Собеседник подключился!**", reply_markup=in_chat_keyboard())
+    else:
+        await message.answer("❌ Неверный ПИН-код.", reply_markup=main_keyboard(uid))
+        await state.clear()
+
+@dp.message(F.text == "❌ Завершить диалог")
+async def leave_chat(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid in active_chats:
+        peer_id = active_chats.pop(uid)
+        if peer_id in active_chats:
+            active_chats.pop(peer_id)
+            await bot.send_message(peer_id, "🔴 Собеседник завершил диалог.", reply_markup=main_keyboard(peer_id))
+        await state.clear()
+        await message.answer("🚪 Вы вышли из чата.", reply_markup=main_keyboard(uid))
+
+# Пересылка сообщений
+@dp.message()
+async def relay_message(message: types.Message):
+    uid = message.from_user.id
+    if uid not in active_chats:
+        await message.answer("👇 Выберите действие в меню:", reply_markup=main_keyboard(uid))
+        return
+    peer_id = active_chats[uid]
+    try:
+        await message.copy_to(chat_id=peer_id)
+    except Exception:
+        await message.answer("⚠️ Не удалось доставить сообщение.")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
